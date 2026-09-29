@@ -7,6 +7,7 @@
 <meta name="referrer" content="no-referrer">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Morse Light">
+<link rel="apple-touch-icon" href="icon-180.png">
 <title>Morse Light</title>
 <!--
   Message page for the Morse Light watch app. The watch QR code opens this page as
@@ -14,7 +15,9 @@
   phone except as described here: its first 8 bytes name a topic on the public ntfy.sh
   relay, and its last 16 bytes are an AES-128 key. Each message is encrypted on the
   phone (AES-CBC, WebCrypto) and posted to that topic; the watch polls the topic while
-  Morse Light is open and decrypts it. No analytics, no other requests.
+  Morse Light is open and decrypts it. With no signal, messages wait in this browser's
+  storage and send by themselves later; sw.js keeps the page itself available offline.
+  No analytics, no other requests.
 -->
 <style>
   :root {
@@ -53,10 +56,13 @@
   button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
   button:disabled { opacity: 0.45; cursor: default; }
   #status { min-height: 1.45em; margin: 12px 2px 0; font-size: 15px; }
-  #status.bad { color: var(--bad); } #status.good { color: var(--good); }
+  #status.bad { color: var(--bad); } #status.good { color: var(--good); } #status.wait { color: var(--accent); }
   ul { list-style: none; padding: 0; margin: 18px 0 0; }
-  li { padding: 8px 2px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; font-size: 15px; }
-  li span:last-child { color: var(--muted); white-space: nowrap; }
+  li { padding: 8px 2px; border-top: 1px solid var(--line); display: flex; align-items: center; gap: 12px; font-size: 15px; }
+  li .msg { flex: 1; overflow-wrap: anywhere; }
+  li .info { color: var(--muted); white-space: nowrap; }
+  li .info.waiting { color: var(--accent); }
+  button.remove { flex: none; min-height: 0; width: 32px; height: 32px; border: none; padding: 0; font-size: 20px; color: var(--muted); }
   .note { color: var(--muted); font-size: 13px; margin-top: 22px; }
   .missing { text-align: center; padding: 28px 8px; }
 </style>
@@ -83,15 +89,29 @@
     <p class="sub">On the watch open Morse Light › Phone, then point your phone camera at the QR code.</p>
   </section>
 
-  <p class="note">Keep Morse Light open on the watch; a message shows up within about 10 seconds.
-    Messages are encrypted on this phone with a key from the watch code, then passed through the free
-    ntfy.sh relay, which cannot read them. Add this page to your Home Screen to keep it.</p>
+  <p class="note">Keep Morse Light open on the watch; a message shows up within about 10 seconds, and
+    one sent up to 5 minutes before you open it still arrives.</p>
+  <p class="note">No signal? Messages wait on this phone and send by themselves once it is back online.
+    A Flash now that waits more than 10 minutes goes out as Save on watch, so the watch never starts
+    flashing unexpectedly. Add this page to your Home Screen so it also opens with no signal.</p>
+  <p class="note">Messages are encrypted on this phone with a key from the watch code, then passed
+    through the free ntfy.sh relay, which cannot read them.</p>
 </main>
 <script>
 "use strict";
 const MAX = 48;
 const ALLOWED = /[A-Z0-9.,?\/ ]/;
 const STORE = "morselight-secret";
+const OUTBOX = "morselight-outbox";
+const RELAY = "https://ntfy.sh/";
+const RETRY_MS = 15000;
+const POST_TIMEOUT_MS = 15000;
+// A Flash now that waited longer than this is sent as Save, so the watch never starts
+// flashing long after the tap.
+const LATE_FLASH_MS = 10 * 60 * 1000;
+const KEEP_DONE = 20;
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 
 // Same cleanup as the watch: uppercase, supported characters, single spaces, 48 max.
 function clean(raw, keepTrailingSpace) {
@@ -115,23 +135,27 @@ function fromBase64Url(s) {
   return Uint8Array.from(bin, c => c.charCodeAt(0));
 }
 const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+const isSecret = s => typeof s === "string" && /^[A-Za-z0-9_-]{32}$/.test(s);
+
+// 24 bytes: the first 8 name the relay topic, the last 16 are the AES key.
+function linkFor(secret) {
+  const bytes = fromBase64Url(secret);
+  return bytes.length === 24 ? { secret, topic: "ml" + hex(bytes.slice(0, 8)), key: bytes.slice(8, 24) } : null;
+}
 
 function readSecret() {
   const fromHash = location.hash.slice(1);
-  let secret = null;
+  let secret = isSecret(fromHash) ? fromHash : null;
   try {
-    if (/^[A-Za-z0-9_-]{32}$/.test(fromHash)) {
-      secret = fromHash;
-      localStorage.setItem(STORE, secret);
-    } else {
-      secret = localStorage.getItem(STORE);
-    }
+    if (secret) localStorage.setItem(STORE, secret);
+    else secret = localStorage.getItem(STORE);
   } catch (e) {
-    secret = /^[A-Za-z0-9_-]{32}$/.test(fromHash) ? fromHash : null;
+    // Storage blocked: the address still works for this visit.
   }
-  if (!secret) return null;
-  const bytes = fromBase64Url(secret);
-  return bytes.length === 24 ? { topic: "ml" + hex(bytes.slice(0, 8)), key: bytes.slice(8, 24) } : null;
+  if (!isSecret(secret)) return null;
+  // Keep the secret in the address, so Add to Home Screen saves a page that knows the watch.
+  if (!isSecret(fromHash)) history.replaceState(null, "", "#" + secret);
+  return linkFor(secret);
 }
 
 async function seal(key, plain) {
@@ -143,8 +167,137 @@ async function seal(key, plain) {
   return btoa(String.fromCharCode(...all));
 }
 
-const link = readSecret();
+// ---- Outbox ----
+// Every message goes through here, oldest first:
+//   { id, secret, nonce, msg, flash, at, state: "queued" | "sent" | "late" | "failed", sentAt }
+// The nonce is fixed when the message is written, so if a send times out after the relay
+// took it, the retry is a repeat the watch skips.
+
+let outbox = [];
+try {
+  const v = JSON.parse(localStorage.getItem(OUTBOX) || "[]");
+  if (Array.isArray(v)) outbox = v.filter(m => m && typeof m.msg === "string");
+} catch (e) {
+  outbox = [];
+}
+
+function saveOutbox() {
+  const done = outbox.filter(m => m.state !== "queued");
+  const old = new Set(done.slice(0, Math.max(0, done.length - KEEP_DONE)));
+  outbox = outbox.filter(m => !old.has(m));
+  try { localStorage.setItem(OUTBOX, JSON.stringify(outbox)); } catch (e) { /* kept in memory only */ }
+}
+
+const waiting = () => outbox.filter(m => m.state === "queued");
+
+async function post(item) {
+  const link = linkFor(item.secret);
+  const late = item.flash && Date.now() - item.at > LATE_FLASH_MS;
+  const body = await seal(link.key, "ML1|" + item.nonce + "|MSG|" + item.msg + (item.flash && !late ? "|SEND" : ""));
+  const stop = new AbortController();
+  const timer = setTimeout(() => stop.abort(), POST_TIMEOUT_MS);
+  try {
+    const res = await fetch(RELAY + link.topic, { method: "POST", body, referrerPolicy: "no-referrer", cache: "no-store", signal: stop.signal });
+    return { res, late };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Sends what is waiting, in order. Resolves to null, "offline", "busy", or "failed".
+let running = null;
+let retryTimer = 0;
+function flush() {
+  if (!running) running = sendWaiting().finally(() => { running = null; });
+  return running;
+}
+
+async function sendWaiting() {
+  clearTimeout(retryTimer);
+  let problem = null;
+  for (let item; (item = waiting()[0]);) {
+    let out;
+    try {
+      out = await post(item);
+    } catch (e) {
+      problem = "offline";
+      break;
+    }
+    if (out.res.status === 429) {
+      problem = "busy";
+      break;
+    }
+    if (out.res.ok) {
+      item.state = out.late ? "late" : "sent";
+      item.sentAt = Date.now();
+      delete item.secret;
+      delete item.nonce;
+    } else {
+      item.state = "failed";
+      item.error = out.res.status;
+      problem = "failed";
+    }
+    saveOutbox();
+    render();
+  }
+  if (waiting().length > 0) retryTimer = setTimeout(flush, RETRY_MS);
+  render();
+  return problem;
+}
+
+// ---- Page ----
+
 const $ = id => document.getElementById(id);
+const clock = t => new Date(t).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
+function render() {
+  const list = $("sent");
+  if (!list) return;
+  list.replaceChildren(...outbox.slice().reverse().map(item => {
+    const li = document.createElement("li");
+    const text = document.createElement("span");
+    text.className = "msg";
+    text.textContent = item.msg;
+    const info = document.createElement("span");
+    info.className = "info";
+    const kind = item.flash ? "Flash" : "Save";
+    if (item.state === "queued") {
+      info.className += " waiting";
+      info.textContent = kind + " · waiting";
+    } else if (item.state === "late") {
+      info.textContent = "Save (late) · " + clock(item.sentAt);
+    } else if (item.state === "failed") {
+      info.textContent = kind + " · not sent";
+    } else {
+      info.textContent = kind + " · " + clock(item.sentAt);
+    }
+    li.append(text, info);
+    if (item.state === "queued") {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "remove";
+      remove.textContent = "×";
+      remove.setAttribute("aria-label", "Don't send " + item.msg);
+      remove.addEventListener("click", () => {
+        outbox = outbox.filter(m => m !== item);
+        saveOutbox();
+        render();
+      });
+      li.append(remove);
+    }
+    return li;
+  }));
+}
+
+function waitingText(problem) {
+  const n = waiting().length;
+  const what = n === 1 ? "1 message is" : n + " messages are";
+  return problem === "busy"
+    ? "The relay is busy. " + what + " waiting and will retry by themselves."
+    : "No signal. " + what + " waiting on this phone and will send once it is back online.";
+}
+
+const link = readSecret();
 if (!link) {
   $("missing").hidden = false;
   $("sub").textContent = "Messages for your Garmin watch.";
@@ -152,6 +305,7 @@ if (!link) {
   $("app").hidden = false;
   const text = $("text"), count = $("count"), status = $("status");
   const buttons = [$("flash"), $("save")];
+  const say = (msg, kind) => { status.className = kind || ""; status.textContent = msg; };
   const update = () => {
     const shown = clean(text.value, true);
     if (shown !== text.value) text.value = shown;
@@ -162,34 +316,45 @@ if (!link) {
   text.addEventListener("input", update);
   update();
 
-  async function send(now) {
+  async function send(flash) {
     const msg = clean(text.value, false);
     if (!msg) return;
-    buttons.forEach(b => b.disabled = true);
-    status.className = "";
-    status.textContent = "Sending…";
-    try {
-      const nonce = hex(crypto.getRandomValues(new Uint8Array(8)));
-      const body = await seal(link.key, "ML1|" + nonce + "|MSG|" + msg + (now ? "|SEND" : ""));
-      const res = await fetch("https://ntfy.sh/" + link.topic, { method: "POST", body, referrerPolicy: "no-referrer" });
-      if (!res.ok) throw new Error(res.status === 429 ? "The relay is busy. Wait a minute and try again." : "The relay said " + res.status + ".");
-      status.className = "good";
-      status.textContent = now ? "Sent. The watch starts flashing it when it arrives." : "Sent. It becomes the watch's message.";
-      const li = document.createElement("li");
-      const a = document.createElement("span"); a.textContent = msg;
-      const b = document.createElement("span");
-      b.textContent = (now ? "Flash · " : "Save · ") + new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-      li.append(a, b);
-      $("sent").prepend(li);
-    } catch (e) {
-      status.className = "bad";
-      status.textContent = e instanceof TypeError ? "No internet connection. Try again." : e.message;
-    } finally {
-      update();
+    const item = {
+      id: hex(crypto.getRandomValues(new Uint8Array(6))),
+      secret: link.secret,
+      nonce: hex(crypto.getRandomValues(new Uint8Array(8))),
+      msg, flash, at: Date.now(), state: "queued"
+    };
+    outbox.push(item);
+    saveOutbox();
+    render();
+    say("Sending…");
+    let problem = await flush();
+    // A send that was just finishing may have missed this message.
+    if (item.state === "queued" && !problem) problem = await flush();
+    if (item.state === "sent") {
+      say(flash ? "Sent. The watch starts flashing it when it arrives." : "Sent. It becomes the watch's message.", "good");
+    } else if (item.state === "failed") {
+      say("The relay refused it (" + item.error + "). It was not sent.", "bad");
+    } else if (item.state === "queued") {
+      say(waitingText(problem), "wait");
     }
   }
   $("flash").addEventListener("click", () => send(true));
   $("save").addEventListener("click", () => send(false));
+
+  const resume = async () => {
+    if (waiting().length === 0) return;
+    const before = waiting().length;
+    const problem = await flush();
+    const left = waiting().length;
+    if (left > 0) say(waitingText(problem), "wait");
+    else say((before === 1 ? "The waiting message was" : "The " + before + " waiting messages were") + " sent.", "good");
+  };
+  window.addEventListener("online", resume);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) resume(); });
+  render();
+  resume();
 }
 </script>
 </body>
