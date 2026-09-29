@@ -8,9 +8,11 @@
 <meta name="robots" content="noindex">
 <title>ML Probe Test</title>
 <!--
-  Test for the ML Probe watch app: can an iPhone speaker reach a Garmin watch with no
-  internet? It plays tones in a fixed pattern (1 s on, 1 s off, 5 times per sound) while
-  the watch, lying on the phone, logs its motion sensors. Nothing is sent anywhere.
+  Test 2 for the ML Probe watch app: how quietly can an iPhone speaker reach a Garmin
+  watch lying on it, how fast, and does a playing video change what the iPhone
+  broadcasts over Bluetooth? Everything runs on the phone; nothing is sent anywhere.
+  Timeline (seconds): 0-4 quiet; 4-24 500 Hz at falling volume; 24-44 high pitches;
+  44-52 speed patterns; 52-76 muted video on/off/on.
 -->
 <style>
   :root { --bg: #0e0f11; --card: #1a1c20; --text: #f2f2f2; --muted: #9aa0a6; --accent: #ffaa00; --accent-text: #1a1200; --line: #2c2f35; }
@@ -27,128 +29,114 @@
   main { max-width: 520px; margin: 0 auto; }
   h1 { font-size: 22px; margin: 4px 0 12px; }
   ol { padding-left: 22px; margin: 0 0 16px; }
-  li { margin: 6px 0; }
+  li { margin: 8px 0; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; text-align: center; }
-  #now { font-size: 30px; font-weight: 700; min-height: 1.3em; }
-  #next { color: var(--muted); min-height: 1.4em; }
+  #now { font-size: 28px; font-weight: 700; min-height: 1.3em; }
+  #next { color: var(--muted); min-height: 2.9em; }
   #bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 14px 0; }
   #fill { height: 100%; width: 0; background: var(--accent); }
+  video { width: 100%; border-radius: 10px; margin-top: 12px; background: #000; }
   button { width: 100%; min-height: 54px; border-radius: 12px; border: none; background: var(--accent); color: var(--accent-text); font-family: inherit; font-size: 18px; font-weight: 600; }
   button:disabled { opacity: 0.45; }
-  .muted { color: var(--muted); font-size: 14px; }
 </style>
 </head>
 <body>
 <main>
-  <h1>ML Probe test</h1>
-  <ol>
-    <li>Turn the phone's volume all the way up.</li>
-    <li>On the watch, open <strong>ML Probe</strong>.</li>
-    <li>Lay the phone flat on a table. Lay the watch on the screen, on the bottom third, near the speaker. Don't touch either during the test.</li>
-    <li>Tap <strong>Start</strong>. When it says <strong>GO</strong>, press the watch's <strong>START</strong> button once.</li>
+  <h1>ML Probe test 2</h1>
+  <ol id="steps">
+    <li>Set the phone's volume to about <strong>half</strong>.</li>
+    <li>Open <strong>ML Probe</strong> on the watch. Lay the phone flat and put the watch on it, near the bottom.</li>
+    <li>Tap <strong>Run</strong>, then leave both alone until it says <strong>Done</strong> (about 75 seconds).</li>
   </ol>
   <section class="card">
     <div id="now">Ready</div>
-    <div id="next">About 2 minutes</div>
+    <div id="next">Mostly soft, short beeps</div>
     <div id="bar"><div id="fill"></div></div>
-    <button id="start" type="button">Start</button>
+    <button id="run" type="button">Run</button>
+    <video id="clip" src="clip.mp4" muted playsinline loop preload="auto" hidden></video>
   </section>
-  <p class="muted">Then, for the Bluetooth part: lock the phone, wait 5 seconds, unlock it. Do that 3 times. Afterwards, plug the watch into the PC.</p>
 </main>
 <script>
 "use strict";
-// Each step: a label, and either silence or a sound played 1 s on / 1 s off, 5 times.
-const QUIET_S = 6;
-const SOUNDS = [
-  { label: "30 Hz buzz", type: "square", hz: 30 },
-  { label: "60 Hz buzz", type: "square", hz: 60 },
-  { label: "120 Hz tone", type: "sine", hz: 120 },
-  { label: "250 Hz tone", type: "sine", hz: 250 },
-  { label: "500 Hz tone", type: "sine", hz: 500 },
-  { label: "1000 Hz tone", type: "sine", hz: 1000 },
-  { label: "2000 Hz tone", type: "sine", hz: 2000 },
-  { label: "4000 Hz tone", type: "sine", hz: 4000 },
-  { label: "Noise", type: "noise" }
-];
-const CYCLES = 5;
-const GAP_S = 3;
-const STEP_S = CYCLES * 2 + GAP_S;
 const $ = id => document.getElementById(id);
+const QUIET = 4;
+const GROUP = 4;                                  // 3 pulses (0.5 s on, 0.5 s off) + 1 s gap
+const VOLUMES = [1, 0.3, 0.1, 0.03, 0.01];        // 500 Hz, relative to the phone's volume
+const PITCHES = [8000, 12000, 16000, 18000, 20000];
+const PATTERN = "1011001110001011";              // speed test bits
+const SPEEDS = [                                  // [start s, Hz, gain, bit s]
+  [44, 500, 0.3, 0.1], [46, 500, 0.3, 0.05], [48, 18000, 1, 0.1], [50, 18000, 1, 0.05]
+];
+const VIDEO = [[52, 60], [68, 76]];
+const TOTAL = 76;
 
-function noiseBuffer(ctx) {
-  const buf = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
-  const data = buf.getChannelData(0);
-  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
-  return buf;
+const PARTS = [
+  [0, "Quiet", "Measuring the background"],
+  [4, "Volume test", "500 Hz beeps, getting quieter"],
+  [24, "High pitch test", "Very high beeps; some may be silent"],
+  [44, "Speed test", "Short chirps"],
+  [52, "Bluetooth test", "A silent video plays, stops, and plays again"]
+];
+
+function tone(ctx, dest, hz, gain, on, off) {
+  const osc = ctx.createOscillator();
+  osc.frequency.value = hz;
+  const g = ctx.createGain();
+  g.gain.value = 0;
+  osc.connect(g).connect(dest);
+  g.gain.setValueAtTime(0, on);
+  g.gain.linearRampToValueAtTime(gain, on + 0.004);
+  g.gain.setValueAtTime(gain, off - 0.004);
+  g.gain.linearRampToValueAtTime(0, off);
+  osc.start(on);
+  osc.stop(off + 0.01);
 }
 
-// Schedules the whole pattern on the audio clock; returns its length in seconds.
 function schedule(ctx, t0) {
-  const out = ctx.createGain();
-  out.gain.value = 0;
-  out.connect(ctx.destination);
-  let t = t0 + QUIET_S;
-  const noise = noiseBuffer(ctx);
-  for (const s of SOUNDS) {
-    let src;
-    if (s.type === "noise") {
-      src = ctx.createBufferSource();
-      src.buffer = noise;
-      src.loop = true;
-    } else {
-      src = ctx.createOscillator();
-      src.type = s.type;
-      src.frequency.value = s.hz;
+  const out = ctx.destination;
+  const group = (start, hz, gain) => {
+    for (let p = 0; p < 3; p++) tone(ctx, out, hz, gain, start + p, start + p + 0.5);
+  };
+  VOLUMES.forEach((v, i) => group(t0 + QUIET + i * GROUP, 500, v));
+  PITCHES.forEach((hz, i) => group(t0 + 24 + i * GROUP, hz, 1));
+  for (const [start, hz, gain, bit] of SPEEDS) {
+    for (let b = 0; b < PATTERN.length; b++) {
+      if (PATTERN[b] === "1") tone(ctx, out, hz, gain, t0 + start + b * bit, t0 + start + (b + 1) * bit);
     }
-    const g = ctx.createGain();
-    g.gain.value = 0;
-    src.connect(g).connect(out);
-    for (let c = 0; c < CYCLES; c++) {
-      const on = t + c * 2;
-      g.gain.setValueAtTime(0, on);
-      g.gain.linearRampToValueAtTime(1, on + 0.005);
-      g.gain.setValueAtTime(1, on + 0.995);
-      g.gain.linearRampToValueAtTime(0, on + 1);
-    }
-    src.start(t);
-    src.stop(t + CYCLES * 2);
-    t += STEP_S;
   }
-  out.gain.setValueAtTime(1, t0);
-  return t - t0;
 }
 
-$("start").addEventListener("click", async () => {
-  $("start").disabled = true;
-  // Play through the silent switch, and keep the screen on.
+$("run").addEventListener("click", async () => {
+  $("run").disabled = true;
   try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
   try { if (navigator.wakeLock) await navigator.wakeLock.request("screen"); } catch (e) {}
+  const video = $("clip");
+  // Start and pause once inside the tap, so later plays are allowed.
+  try { await video.play(); video.pause(); } catch (e) {}
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
   await ctx.resume();
   const t0 = ctx.currentTime + 0.3;
-  const total = schedule(ctx, t0);
+  schedule(ctx, t0);
+  let playing = false;
   const tick = () => {
     const e = ctx.currentTime - t0;
-    $("fill").style.width = Math.min(100, 100 * e / total) + "%";
-    if (e < 2) {
-      $("now").textContent = "GO";
-      $("next").textContent = "Press START on the watch now";
-    } else if (e < QUIET_S) {
-      $("now").textContent = "Quiet";
-      $("next").textContent = "Don't touch the phone or watch";
-    } else if (e < total) {
-      const i = Math.floor((e - QUIET_S) / STEP_S);
-      const inStep = (e - QUIET_S) % STEP_S;
-      const s = SOUNDS[i];
-      $("now").textContent = s.label;
-      $("next").textContent = inStep < CYCLES * 2
-        ? (inStep % 2 < 1 ? "on" : "off") + " · " + (Math.floor(inStep / 2) + 1) + " of " + CYCLES
-        : (i + 1 < SOUNDS.length ? "Next: " + SOUNDS[i + 1].label : "Almost done");
-    } else {
-      $("now").textContent = "Done";
-      $("next").textContent = "Now the Bluetooth part below";
-      $("start").disabled = false;
+    $("fill").style.width = Math.max(0, Math.min(100, 100 * e / TOTAL)) + "%";
+    const part = PARTS.filter(p => e >= p[0]).pop() || PARTS[0];
+    $("now").textContent = part[1];
+    $("next").textContent = part[2];
+    const want = VIDEO.some(([a, b]) => e >= a && e < b);
+    video.hidden = e < VIDEO[0][0];
+    if (want !== playing) {
+      playing = want;
+      if (want) video.play().catch(() => {}); else video.pause();
+    }
+    if (e >= TOTAL) {
+      video.pause();
+      video.hidden = true;
       ctx.close();
+      $("fill").style.width = "100%";
+      $("now").textContent = "Done";
+      $("next").textContent = "Last step: press the phone's side button to lock it, count to 10, then unlock it. Then plug the watch into the PC.";
       return;
     }
     requestAnimationFrame(tick);
