@@ -17,9 +17,12 @@ self.addEventListener("activate", event => {
 
 self.addEventListener("fetch", event => {
   const req = event.request;
-  if (req.method !== "GET" || new URL(req.url).origin !== location.origin) return;
-  // Every page load is the same page; the secret after '#' never reaches here.
-  event.respondWith(answer(req, req.mode === "navigate" ? "./" : req));
+  const url = new URL(req.url);
+  if (req.method !== "GET" || url.origin !== location.origin) return;
+  // The message page is one entry however it is addressed (with or without a query);
+  // the secret after '#' never reaches here. Other files keep their own entries.
+  const page = req.mode === "navigate" && /\/(index\.html)?$/.test(url.pathname);
+  event.respondWith(answer(req, page ? "./" : req));
 });
 
 async function answer(req, key) {
